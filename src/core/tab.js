@@ -127,7 +127,13 @@ export async function newTab({ layout, name } = {}) {
         })()
       `);
       if (!clicked) throw new Error('New-tab button not found in shell window.');
-      await new Promise(r => setTimeout(r, 1500));
+      // Target registration can lag well past 1.5s on Desktop 3.3.0 —
+      // poll for the landing page (500ms interval, up to 10s) instead of
+      // a single fixed sleep.
+      for (let i = 0; i < 20; i++) {
+        await new Promise(r => setTimeout(r, 500));
+        if (await findLandingTarget()) break;
+      }
       const after = await evalIn(`document.querySelectorAll('.tabs-container .tab').length`);
       return { before, after };
     });
@@ -276,6 +282,21 @@ export async function closeTab() {
   try { await getClient(); } catch { /* next tool call will reconnect */ }
 
   return { success: result < before, action: 'tab_closed', tabs_before: before, tabs_after: result };
+}
+
+/**
+ * Close a specific CDP target by id via the DevTools HTTP endpoint
+ * (GET /json/close/<targetId>). Unlike closeTab(), this does not depend on
+ * the shell window's tab bar and can close background tabs.
+ */
+export async function closeTargetById({ targetId }) {
+  if (!targetId) throw new Error('targetId required. Usage: closeTargetById({ targetId })');
+  const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/close/${targetId}`);
+  const text = await resp.text();
+  if (!resp.ok) {
+    throw new Error(`Failed to close target ${targetId}: ${resp.status} ${text.trim()}`);
+  }
+  return { success: true, action: 'target_closed', target_id: targetId, response: text.trim() };
 }
 
 /**

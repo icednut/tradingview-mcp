@@ -3,6 +3,7 @@
  * Zero dependencies — uses only Node.js built-ins.
  */
 import { parseArgs } from 'node:util';
+import { setTargetChartId } from '../connection.js';
 
 /** @type {Map<string, { description: string, options?: object, handler: Function, subcommands?: Map<string, object> }>} */
 const commands = new Map();
@@ -23,6 +24,8 @@ function printHelp() {
       console.log(`  ${name.padEnd(maxLen + 2)}${cmd.description}`);
     }
   }
+  console.log('\nGlobal flags (before the command):');
+  console.log('  --target <chartId>  Pin the command to the tab whose URL contains /chart/<chartId>/');
   console.log('\nRun "tv <command> --help" for command-specific options.');
   console.log('\nDISCLAIMER');
   console.log('  Not affiliated with TradingView Inc. or Anthropic, PBC.');
@@ -52,6 +55,23 @@ function printCommandHelp(name, cmd) {
 
 export async function run(argv) {
   const args = argv.slice(2);
+
+  // Global flags (must come before the command), e.g. tv --target <chartId> state
+  if (args[0] === '--target' || (typeof args[0] === 'string' && args[0].startsWith('--target='))) {
+    let chartId;
+    if (args[0] === '--target') {
+      chartId = args[1];
+      args.splice(0, 2);
+    } else {
+      chartId = args[0].slice('--target='.length);
+      args.splice(0, 1);
+    }
+    if (!chartId) {
+      console.error('--target requires a chart id. Usage: tv --target <chartId> <command>');
+      process.exit(1);
+    }
+    setTargetChartId(chartId);
+  }
 
   if (args.length === 0 || args[0] === '--help' || args[0] === '-h') {
     printHelp();

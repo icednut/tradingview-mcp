@@ -50,6 +50,43 @@ export function requireFinite(value, name) {
   return n;
 }
 
+// When set (via the CLI's global --target flag), connect() resolves the CDP
+// target by chart id instead of taking the first TradingView chart page.
+let targetChartId = null;
+
+/**
+ * Pin subsequent connects to the chart tab whose URL contains /chart/<id>/.
+ * Pass a falsy value to clear and restore first-match behavior.
+ */
+export function setTargetChartId(id) {
+  targetChartId = id || null;
+}
+
+/**
+ * Pure resolver: pick the single page target whose URL contains /chart/<chartId>/.
+ * Throws with machine-readable tokens:
+ *   TARGET_NOT_FOUND  — no page target matches the chart id
+ *   TARGET_AMBIGUOUS  — more than one page target matches (ids listed)
+ */
+export function resolveChartTarget(targets, chartId) {
+  const matches = targets.filter(t =>
+    t.type === 'page' && String(t.url || '').includes('/chart/' + chartId + '/')
+  );
+  if (matches.length === 0) {
+    throw new Error(`TARGET_NOT_FOUND: no page target with /chart/${chartId}/ in its URL`);
+  }
+  if (matches.length > 1) {
+    throw new Error(`TARGET_AMBIGUOUS: ${matches.length} page targets match /chart/${chartId}/ (target ids: ${matches.map(t => t.id).join(', ')})`);
+  }
+  return matches[0];
+}
+
+async function findTargetByChartId(chartId) {
+  const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
+  const targets = await resp.json();
+  return resolveChartTarget(targets, chartId);
+}
+
 export async function getClient() {
   if (client) {
     try {
@@ -68,7 +105,9 @@ export async function connect(targetId = null) {
   let lastError;
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
-      const target = targetId ? await findTargetById(targetId) : await findChartTarget();
+      const target = targetId
+        ? await findTargetById(targetId)
+        : (targetChartId ? await findTargetByChartId(targetChartId) : await findChartTarget());
       if (!target) {
         throw new Error(targetId
           ? `CDP target ${targetId} not found — is the tab still open?`
