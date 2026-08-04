@@ -73,6 +73,15 @@ export async function run(argv) {
     setTargetChartId(chartId);
   }
 
+  // --target anywhere else would be silently swallowed by parseArgs
+  // (strict:false treats it as an unknown boolean) and the command would run
+  // unpinned against the first-match tab. Reject it loudly instead.
+  const stray = args.findIndex(a => typeof a === 'string' && (a === '--target' || a.startsWith('--target=')));
+  if (stray !== -1) {
+    console.error('--target is a global flag and must come before the command. Usage: tv --target <chartId> <command>');
+    process.exit(1);
+  }
+
   if (args.length === 0 || args[0] === '--help' || args[0] === '-h') {
     printHelp();
     process.exit(0);

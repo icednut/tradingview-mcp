@@ -291,7 +291,18 @@ export async function closeTab() {
  */
 export async function closeTargetById({ targetId }) {
   if (!targetId) throw new Error('targetId required. Usage: closeTargetById({ targetId })');
-  const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/close/${targetId}`);
+  // Guard against path traversal into other /json/* endpoints (e.g. a
+  // targetId like "../activate/X" or "../new?url=..."): allowlist the id
+  // format, confirm the target actually exists, and encode the path segment.
+  if (!/^[A-Za-z0-9_-]+$/.test(String(targetId))) {
+    throw new Error(`Invalid targetId "${targetId}": must contain only letters, digits, "_" or "-".`);
+  }
+  const listResp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
+  const targets = await listResp.json();
+  if (!targets.some(t => t.id === targetId)) {
+    throw new Error(`Target ${targetId} not found in /json/list. Use tab list to get valid target ids.`);
+  }
+  const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/close/${encodeURIComponent(targetId)}`);
   const text = await resp.text();
   if (!resp.ok) {
     throw new Error(`Failed to close target ${targetId}: ${resp.status} ${text.trim()}`);

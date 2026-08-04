@@ -123,6 +123,10 @@ export async function connect(targetId = null) {
 
       return client;
     } catch (err) {
+      // Target resolution verdicts are deterministic — retrying re-reads the
+      // same /json/list and burns ~16s of backoff before failing anyway. Callers
+      // poll on a schedule and need the verdict now, so surface it immediately.
+      if (/TARGET_NOT_FOUND|TARGET_AMBIGUOUS/.test(err?.message || '')) throw err;
       lastError = err;
       const delay = Math.min(BASE_DELAY * Math.pow(2, attempt), 30000);
       await new Promise(r => setTimeout(r, delay));
