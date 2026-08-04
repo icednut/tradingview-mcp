@@ -252,6 +252,186 @@ export async function newTab({ layout, name } = {}) {
   };
 }
 
+// --- open-chart (chart-id navigation) ---------------------------------------
+
+/** Chart ids go into a URL path segment; keep the same allowlist as closeTargetById. */
+const CHART_ID_RE = /^[A-Za-z0-9_-]+$/;
+
+/**
+ * Validate a chart id for URL-path interpolation. Returns the id, throws otherwise.
+ * Exported for tests.
+ */
+export function assertValidChartId(chartId) {
+  if (!chartId) throw new Error('chartId required. Usage: openChartById({ chartId })');
+  if (!CHART_ID_RE.test(String(chartId))) {
+    throw new Error(`Invalid chartId "${chartId}": must contain only letters, digits, "_" or "-".`);
+  }
+  return String(chartId);
+}
+
+/**
+ * Pure: page targets already showing /chart/<chartId>/.
+ * Exported for tests.
+ */
+export function matchChartTargets(targets, chartId) {
+  return (targets || []).filter(t =>
+    t.type === 'page' && String(t.url || '').includes(`/chart/${chartId}/`)
+  );
+}
+
+// Reads the live chart widget; null until the chart API has booted.
+const CHART_STATE_EXPR = `(function(){
+  try {
+    var ch = window.TradingViewApi._activeChartWidgetWV.value();
+    return JSON.stringify({ symbol: ch.symbol(), resolution: String(ch.resolution()), studies: ch.getAllStudies().length });
+  } catch (e) { return null; }
+})()`;
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+/** Real-world implementations; tests inject fakes so nothing touches CDP. */
+function defaultOpenChartDeps() {
+  return {
+    listTargets: async () => {
+      const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
+      return resp.json();
+    },
+    findLandingTarget,
+    newTab,
+    closeTargetById,
+    connect: (targetId) => CDP({ host: CDP_HOST, port: CDP_PORT, target: targetId }),
+    sleep,
+  };
+}
+
+/** Best-effort single read of the chart state from an already-loaded target. */
+async function readChartState(deps, targetId) {
+  let c = null;
+  try {
+    c = await deps.connect(targetId);
+    await c.Runtime.enable();
+    const { result } = await c.Runtime.evaluate({ expression: CHART_STATE_EXPR, returnByValue: true });
+    return result?.value ? JSON.parse(result.value) : null;
+  } catch {
+    return null;
+  } finally {
+    try { if (c) await c.close(); } catch { /* already gone */ }
+  }
+}
+
+/**
+ * Open a chart tab by chart id, without touching the layout picker.
+ *
+ * The layout-name path (newTab({ layout })) searches a virtualized DOM list of
+ * saved layouts and fails non-deterministically once the list is long enough
+ * ("Layout matching ... not found"). Navigating straight to
+ * https://www.tradingview.com/chart/<chartId>/ has no DOM search in it:
+ *   1. open a bare landing tab (no layout argument), reusing one if present
+ *   2. CDP Page.navigate that target to the chart URL
+ *   3. poll until window.TradingViewApi._activeChartWidgetWV.value() answers
+ *
+ * If the chart is already open, returns it untouched instead of opening a
+ * duplicate. Extra duplicate targets are closed so exactly one remains —
+ * `tv --target <chartId>` fails with TARGET_AMBIGUOUS otherwise.
+ */
+export async function openChartById({ chartId, timeoutMs = 40000 } = {}, deps = {}) {
+  const id = assertValidChartId(chartId);
+  const d = { ...defaultOpenChartDeps(), ...deps };
+  const budgetMs = Number(timeoutMs);
+  const attempts = Math.max(1, Math.ceil((Number.isFinite(budgetMs) ? budgetMs : 40000) / 1000));
+
+  // Already open? Don't open a second tab for the same chart.
+  const existing = matchChartTargets(await d.listTargets(), id);
+  if (existing.length > 0) {
+    const keep = await pruneDuplicates(d, existing, id);
+    return {
+      success: true,
+      action: 'already_open',
+      already_open: true,
+      chart_id: id,
+      target_id: keep.id,
+      ...(await stateFields(d, keep.id)),
+    };
+  }
+
+  // 1) A landing tab (layout picker) — reuse one if it's already open.
+  let landing = await d.findLandingTarget();
+  if (!landing) {
+    await d.newTab();
+    for (let i = 0; i < 20 && !landing; i++) {
+      landing = await d.findLandingTarget();
+      if (!landing) await d.sleep(500);
+    }
+  }
+  if (!landing) throw new Error('New tab opened but its landing page target was not found.');
+
+  // 2) Navigate that target straight to the chart URL and wait for the chart API.
+  const url = `https://www.tradingview.com/chart/${encodeURIComponent(id)}/`;
+  let state = null;
+  let c = null;
+  try {
+    c = await d.connect(landing.id);
+    await c.Page.enable();
+    await c.Page.navigate({ url });
+    await c.Runtime.enable();
+    for (let i = 0; i < attempts; i++) {
+      await d.sleep(1000);
+      const { result } = await c.Runtime.evaluate({ expression: CHART_STATE_EXPR, returnByValue: true });
+      if (result?.value) { state = JSON.parse(result.value); break; }
+    }
+  } finally {
+    try { if (c) await c.close(); } catch { /* already gone */ }
+  }
+  if (!state) {
+    throw new Error(`Navigated to ${url} but the chart API never became ready within ${attempts}s.`);
+  }
+
+  // 3) Exactly one target must be serving this chart id.
+  const after = matchChartTargets(await d.listTargets(), id);
+  if (after.length === 0) {
+    throw new Error(`Chart ${id} loaded but no page target with /chart/${id}/ is listed.`);
+  }
+  const keep = await pruneDuplicates(d, after, id, landing.id);
+
+  return {
+    success: true,
+    action: 'chart_opened',
+    already_open: false,
+    chart_id: id,
+    target_id: keep.id,
+    symbol: state.symbol ?? null,
+    resolution: state.resolution ?? null,
+    studies: state.studies ?? null,
+  };
+}
+
+/**
+ * Keep one matching target (the one we navigated, if it is among them) and
+ * close the rest. Returns the survivor.
+ */
+async function pruneDuplicates(deps, matches, chartId, preferredId = null) {
+  const keep = matches.find(t => t.id === preferredId) || matches[0];
+  const extras = matches.filter(t => t.id !== keep.id);
+  for (const extra of extras) {
+    try {
+      await deps.closeTargetById({ targetId: extra.id });
+    } catch (e) {
+      throw new Error(`Chart ${chartId} is open in ${matches.length} tabs and duplicate ${extra.id} could not be closed: ${e.message}`);
+    }
+  }
+  return keep;
+}
+
+/** symbol/resolution/studies for an already-open chart (nulls if unreadable). */
+async function stateFields(deps, targetId) {
+  const state = await readChartState(deps, targetId);
+  return {
+    symbol: state?.symbol ?? null,
+    resolution: state?.resolution ?? null,
+    studies: state?.studies ?? null,
+  };
+}
+
 /**
  * Close the currently active tab by clicking its close button in the shell.
  */
