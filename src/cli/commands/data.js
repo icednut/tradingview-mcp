@@ -20,7 +20,17 @@ register('ohlcv', {
 
 register('values', {
   description: 'Get current indicator values from data window',
-  handler: () => core.getStudyValues(),
+  options: {
+    at: { type: 'string', description: 'Bar time (unix seconds) to read values at; default = last bar' },
+  },
+  handler: (opts) => {
+    let at;
+    if (opts.at !== undefined) {
+      at = Number(opts.at);
+      if (!Number.isFinite(at)) throw new Error(`--at must be a bar time in unix seconds, got: ${opts.at}`);
+    }
+    return core.getStudyValues({ at });
+  },
 });
 
 register('data', {

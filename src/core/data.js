@@ -1,11 +1,15 @@
 /**
  * Core data access logic.
  */
-import { evaluate, evaluateAsync, KNOWN_PATHS, safeString } from '../connection.js';
+import { evaluate, evaluateAsync, KNOWN_PATHS, requireFinite, safeString } from '../connection.js';
 import { waitForChartReady } from '../wait.js';
 
 const MAX_OHLCV_BARS = 500;
 const MAX_TRADES = 20;
+// How far back `values --at` walks a study's PlotList looking for the target
+// bar. The scan is backwards from lastIndex(), so this caps the work per study
+// when the requested bar is off the loaded range entirely.
+const MAX_STUDY_VALUE_SCAN_BARS = 600;
 
 // Round to 8 dp — enough to kill float noise (29899.999999997 → 29900) without
 // destroying precision on forex/crypto prices. The old 2-dp rounding flattened
@@ -493,7 +497,100 @@ export async function getDepth() {
   return { success: true, bid_levels: data.bids?.length || 0, ask_levels: data.asks?.length || 0, spread: data.spread, bids: data.bids || [], asks: data.asks || [], raw_values: data.raw_values, note: data.note };
 }
 
-export async function getStudyValues() {
+/**
+ * Map one study's raw PlotList row onto { title: number }.
+ *
+ * `raw` is exactly what PlotList.valueAt(i) returns: [time, plot_0, plot_1, ...],
+ * so raw[i + 1] is the value for plotTitles[i]. Values stay as raw numbers —
+ * unlike the Data Window path, which yields formatted strings ("63,830.7").
+ *
+ * Pure — exported for unit tests.
+ */
+export function buildValuesFromRaw({ plotTitles, raw } = {}) {
+  const values = {};
+  if (!Array.isArray(raw) || !Array.isArray(plotTitles)) return values;
+  for (let i = 0; i < plotTitles.length; i++) {
+    const title = plotTitles[i];
+    if (typeof title !== 'string' || title === '') continue;
+    const v = raw[i + 1];
+    if (typeof v !== 'number' || !Number.isFinite(v)) continue;
+    values[title] = v;
+  }
+  return values;
+}
+
+// `values --at <unixSec>` path. The Data Window (the default path below) always
+// reports the LAST bar, so backfilling a past slot stamped every row with the
+// value at collection time. Here we read the study's own PlotList instead,
+// which is indexed the same as the main series, and pull the row whose time
+// equals the requested bar. The page-context code returns a raw dump only;
+// title/value mapping happens in Node via buildValuesFromRaw().
+async function getStudyValuesAt(at) {
+  const dump = await evaluate(`
+    (function() {
+      var at = ${at};
+      var chart = window.TradingViewApi._activeChartWidgetWV.value()._chartWidget;
+      var model = chart.model();
+      var sources = model.model().dataSources();
+      var results = [];
+      for (var si = 0; si < sources.length; si++) {
+        var s = sources[si];
+        if (!s.metaInfo) continue;
+        try {
+          var meta = s.metaInfo();
+          var name = meta.description || meta.shortDescription || '';
+          if (!name) continue;
+          // Plot order is metaInfo().plots order; titles live in styles[plot.id].
+          var plotTitles = [];
+          try {
+            var plots = meta.plots || [];
+            var styles = meta.styles || {};
+            for (var pi = 0; pi < plots.length; pi++) {
+              var plot = plots[pi];
+              var style = plot && plot.id ? styles[plot.id] : null;
+              plotTitles.push(style && style.title ? style.title : null);
+            }
+          } catch(e) {}
+          // Backward scan from the last bar — searchByTime() semantics are not
+          // documented well enough to trust for an exact-time lookup.
+          var raw = null;
+          try {
+            var pl = s.data ? s.data() : null;
+            if (pl && typeof pl.valueAt === 'function' && typeof pl.lastIndex === 'function') {
+              var end = pl.lastIndex();
+              var first = typeof pl.firstIndex === 'function' ? pl.firstIndex() : 0;
+              var start = Math.max(first, end - ${MAX_STUDY_VALUE_SCAN_BARS} + 1);
+              for (var i = end; i >= start; i--) {
+                var v = pl.valueAt(i);
+                if (v && v[0] === at) { raw = v; break; }
+              }
+            }
+          } catch(e) {}
+          var id = null;
+          try { id = s.id ? s.id() : null; } catch(e) {}
+          var inputs = null;
+          try { var ip = s.inputs ? s.inputs() : null; if (ip && Object.keys(ip).length) inputs = ip; } catch(e) {}
+          results.push({ id: id, name: name, inputs: inputs, plotTitles: plotTitles, raw: raw });
+        } catch(e) {}
+      }
+      return results;
+    })()
+  `);
+
+  const dumped = dump || [];
+  const barFound = dumped.some(d => Array.isArray(d?.raw));
+  // Same rule as the Data Window path: a study with zero usable values is
+  // dropped entirely — downstream sweep/settle logic depends on that.
+  const studies = dumped
+    .map(d => ({ id: d.id, name: d.name, inputs: d.inputs, values: buildValuesFromRaw(d) }))
+    .filter(s => Object.keys(s.values).length > 0);
+  return { success: true, at, bar_found: barFound, study_count: studies.length, studies };
+}
+
+export async function getStudyValues({ at } = {}) {
+  if (at !== undefined && at !== null) {
+    return getStudyValuesAt(requireFinite(at, 'at'));
+  }
   const data = await evaluate(`
     (function() {
       var chart = window.TradingViewApi._activeChartWidgetWV.value()._chartWidget;
